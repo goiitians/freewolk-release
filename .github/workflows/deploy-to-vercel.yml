@@ -1,0 +1,96 @@
+name: Deploy release to app.freewolk.com
+
+on:
+  release:
+    types: [published]        # fires automatically on every new GitHub release
+  workflow_dispatch:          # lets you re-deploy any tag by hand
+    inputs:
+      tag:
+        description: "Release tag to deploy (leave blank for latest)"
+        required: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: vercel-production
+  cancel-in-progress: true
+
+env:
+  VERCEL_ORG_ID: ${{ secrets.VERCEL_ORG_ID }}
+  VERCEL_PROJECT_ID: ${{ secrets.VERCEL_PROJECT_ID }}
+  WEB_ASSET: freewolk-web.tar.gz   # the Flutter web build asset on each release
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download the release tarball
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.event.release.tag_name || inputs.tag }}
+        run: |
+          set -euo pipefail
+          mkdir -p dl
+          if [ -n "${TAG:-}" ]; then
+            gh release download "$TAG" --repo "$GITHUB_REPOSITORY" --pattern "$WEB_ASSET" --dir dl
+          else
+            gh release download --repo "$GITHUB_REPOSITORY" --pattern "$WEB_ASSET" --dir dl
+          fi
+          ls -la dl
+
+      - name: Extract and locate the web root
+        run: |
+          set -euo pipefail
+          mkdir -p extracted
+          TARBALL="dl/$WEB_ASSET"
+          tar -xzf "$TARBALL" -C extracted
+          INDEX="$(find extracted -maxdepth 4 -name index.html | head -n1)"
+          if [ -z "$INDEX" ]; then
+            echo "::error::No index.html found inside $TARBALL"
+            find extracted -maxdepth 3
+            exit 1
+          fi
+          echo "WEBROOT=$(dirname "$INDEX")" >> "$GITHUB_ENV"
+          echo "Web root: $(dirname "$INDEX")"
+
+      - name: Install Vercel CLI
+        run: npm install --global vercel@latest
+
+      - name: Pull Vercel project settings
+        run: vercel pull --yes --environment=production --token=${{ secrets.VERCEL_TOKEN }}
+
+      - name: Assemble Vercel Build Output (no build needed — files are prebuilt)
+        run: |
+          set -euo pipefail
+          rm -rf .vercel/output
+          mkdir -p .vercel/output/static
+          cp -R "$WEBROOT"/. .vercel/output/static/
+          cat > .vercel/output/config.json <<'JSON'
+          {
+            "version": 3,
+            "routes": [
+              {
+                "src": "^/$",
+                "headers": { "cache-control": "public, max-age=0, must-revalidate" },
+                "continue": true
+              },
+              {
+                "src": "^/(index\\.html|flutter_bootstrap\\.js|flutter_service_worker\\.js|version\\.json|manifest\\.json)$",
+                "headers": { "cache-control": "public, max-age=0, must-revalidate" },
+                "continue": true
+              },
+              {
+                "src": "^/(assets|canvaskit|icons)/(.*)$",
+                "headers": { "cache-control": "public, max-age=86400" },
+                "continue": true
+              },
+              { "handle": "filesystem" },
+              { "src": "/.*", "dest": "/index.html" }
+            ]
+          }
+          JSON
+          ls -la .vercel/output/static | head -n 20
+
+      - name: Deploy to production
+        run: vercel deploy --prebuilt --prod --token=${{ secrets.VERCEL_TOKEN }}
